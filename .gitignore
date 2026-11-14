@@ -1,0 +1,25 @@
+# Секреты и API-ключи
+.env
+*.key
+
+# Виртуальное окружение и кэш Python / IDE
+venv/
+.venv/
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+
+# Коммерческие прайс-листы поставщиков и временные папки (не выкладывать в Git!)
+*.xlsx
+*.xls
+*.csv
+archive/
+inbox_pricelists/
+inbox_tz/
+output_kp/
+
+# Черновые и временные документы Word в корне проекта
+KP_*.docx
+TKP_*.docx
+~$*.docx
