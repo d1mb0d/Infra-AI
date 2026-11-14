@@ -983,7 +983,7 @@ with tab3:
         if brand_filter != "Все бренды":
             sql_cat += " AND brand LIKE ?"
             p_cat.append(f"%{brand_filter}%")
-        sql_cat += " ORDER BY brand, sku LIMIT 200"
+        sql_cat += " ORDER BY CASE WHEN rrc_price_rub_with_vat IS NOT NULL THEN 0 ELSE 1 END, brand, sku LIMIT 5000"
 
         df_cat = pd.read_sql_query(sql_cat, conn, params=p_cat)
         conn.close()

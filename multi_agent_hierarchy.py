@@ -1,4 +1,6 @@
+import math
 import os
+import re
 import json
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,7 +23,7 @@ from ups_sizing_engine import calculate_ups_system_bom
 
 
 # ==============================================================================
-# УЗЕЛ 1: АГЕНТ-СИСАДМИН (Ветка 1 на схеме — Синхронизация БД, Курсы, Staging)
+# УЗЕЛ 1: АГЕНТ-СИСАДМИН (Ветка 1 — Синхронизация БД, Курсы, Staging)
 # ==============================================================================
 class SysadminAgent:
     """Отвечает строго за безопасное обновление прайсов, курсов валют и новых товаров."""
@@ -66,28 +68,106 @@ class EngineerAgent:
       3) Поиск по техническим паспортам оборудования (HybridKnowledgeRetriever).
     """
 
+    STOP_WORDS = {
+        "для", "или", "без", "под", "через", "серии", "серия", "типа", "тип",
+        "трехфазный", "трёхфазный", "однофазный", "гибридный", "солнечный",
+        "интернет", "сетевого", "соединения", "комплект", "акб", "батарей",
+        "батарея", "аккумуляторная", "инвертор", "модуль", "оборудования",
+    }
+
+    SYNONYM_GROUPS = {
+        "литие": ["LFP", "LiFePO4", "LFPT"],
+        "lifepo4": ["LFP", "LiFePO4", "LFPT"],
+        "мониторинг": ["Logger", "SNMP", "СКУП", "Мониторинг"],
+        "lan": ["LAN", "Logger"],
+        "плк": ["Процессорный модуль", "ПЛК", "PLC", "Модуль"],
+        "процессорн": ["Процессорный", "ПЛК", "CPU"],
+        "шкаф": ["Шкаф", "шкаф", "Стеллаж", "кабинет"],
+        "кабел": ["Кабель", "кабель", "Перемычка", "CAN", "RS485"],
+        "перемыч": ["Перемычка", "перемычка", "Кабель АКБ"],
+    }
+
     def __init__(self):
         seed_infra_engineering_datasheets()
         self.rag_retriever = HybridKnowledgeRetriever()
 
     def consult_datasheets(self, query: str, brand: Optional[str] = None, top_k: int = 3) -> List[Dict[str, Any]]:
-        """Обращается к гибридному RAG-индексу технических паспортов (BM25 + Cosine)."""
         return self.rag_retriever.search(query=query, brand_filter=brand, top_k=top_k)
 
     @staticmethod
     def _build_etim_filter(etim_class: Optional[str]) -> Tuple[str, List[Any]]:
-        """Учитывает как прямой класс ETIM, так и ИБП с внешними АКБ, попавшие в EC_ACCESSORY."""
         if not etim_class:
             return "", []
         if etim_class == "EC_UPS":
-            return " AND (etim_class = 'EC_UPS' OR (etim_class = 'EC_ACCESSORY' AND LOWER(product_name) LIKE 'ибп%'))", []
+            return " AND (etim_class = 'EC_UPS' OR (etim_class = 'EC_ACCESSORY' AND (product_name LIKE 'ИБП%' OR product_name LIKE 'ибп%')))", []
         return " AND etim_class = ?", [etim_class]
+
+    def _extract_search_tokens(self, keyword: Optional[str]) -> List[List[str]]:
+        """Разбивает длинную фразу на группы синонимичных токенов для гибкого поиска в SQLite."""
+        if not keyword:
+            return []
+        # Убираем единицы измерения вроде '20 кВт·ч' или '15 кВт' из текстового запроса
+        cleaned = re.sub(r'\b\d+(?:[.,]\d+)?\s*(?:квт\*?ч|квт|ква|ач|в)\b', ' ', keyword, flags=re.IGNORECASE)
+        raw_words = re.findall(r'[a-zA-Zа-яА-ЯёЁ0-9-]+', cleaned)
+
+        token_groups: List[List[str]] = []
+        for w in raw_words:
+            w_low = w.lower()
+            if len(w_low) < 3 or w_low in self.STOP_WORDS:
+                continue
+            stem = w_low[:-1] if (len(w_low) > 5 and w_low[-1] in "ьияеаыоую") else w_low
+
+            matched_syns = None
+            for prefix, syn_list in self.SYNONYM_GROUPS.items():
+                if w_low.startswith(prefix) or stem.startswith(prefix):
+                    matched_syns = syn_list
+                    break
+
+            if matched_syns:
+                token_groups.append(matched_syns)
+            else:
+                token_groups.append([w, stem] if stem != w_low else [w])
+
+        return token_groups
+
+    @staticmethod
+    def _build_token_sql(token_groups: List[List[str]], require_all: bool = True) -> Tuple[str, List[Any]]:
+        if not token_groups:
+            return "", []
+        group_clauses: List[str] = []
+        params: List[Any] = []
+        for grp in token_groups:
+            or_parts = []
+            for tok in grp:
+                or_parts.append("(product_name LIKE ? OR model_code LIKE ? OR brand LIKE ? OR specifications LIKE ?)")
+                params.extend([f"%{tok}%", f"%{tok}%", f"%{tok}%", f"%{tok}%"])
+            group_clauses.append("(" + " OR ".join(or_parts) + ")")
+
+        joiner = " AND " if require_all else " OR "
+        return " AND (" + joiner.join(group_clauses) + ")", params
+
+    @staticmethod
+    def _adjust_battery_qty_by_kwh(item: Dict[str, Any], keyword: Optional[str], current_qty: int) -> int:
+        """Если в описании запроса указана энергоёмкость в кВт·ч (например, '20 кВт·ч'), пересчитывает число АКБ."""
+        if not keyword or item.get("etim_class") != "EC_BATTERY":
+            return current_qty
+        m_kwh = re.search(r'(\d+(?:[.,]\d+)?)\s*квт\s*[·*•-]?\s*ч', keyword, re.IGNORECASE)
+        if not m_kwh:
+            return current_qty
+        target_kwh = float(m_kwh.group(1).replace(",", "."))
+        v_bat = float(item.get("voltage_v") or 0.0)
+        ah_bat = float(item.get("rated_current_a") or 0.0)
+        if v_bat > 0 and ah_bat > 0:
+            unit_kwh = (v_bat * ah_bat) / 1000.0
+            if unit_kwh > 0:
+                return max(current_qty, math.ceil(target_kwh / unit_kwh))
+        return current_qty
 
     def match_single_requirement(self, req: Dict[str, Any]) -> Dict[str, Any]:
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # 0. Если в заявке указан прямой SKU из нашей базы
+        # 0. Прямой SKU из базы
         direct_sku = req.get("sku")
         if direct_sku:
             cur.execute("SELECT * FROM equipment_items WHERE sku = ?", (direct_sku,))
@@ -99,7 +179,7 @@ class EngineerAgent:
                 res["match_level"] = f"Прямой артикул {direct_sku}"
                 return res
 
-        # 1. Если указан старый заводской код Danfoss
+        # 1. Кросс-замена Danfoss
         legacy_code = req.get("legacy_code")
         if legacy_code:
             rep = find_legacy_replacement(legacy_code)
@@ -122,37 +202,33 @@ class EngineerAgent:
         keyword = req.get("keyword")
         brand = req.get("brand")
 
-        # Нормализация российских номиналов напряжения из ТЗ (380В -> 400В, 220В -> 230В)
         if voltage_v in (380, 380.0):
             voltage_v = 400.0
         elif voltage_v in (220, 220.0):
             voltage_v = 230.0
 
-        # Если запрашивается базовый ПЛК без уточнения, ищем процессорный модуль, а не кабель
         if etim_class == "EC_PLC_HMI" and not keyword:
             keyword = "Процессорный модуль"
 
-        # Отсекаем окончания кириллических слов для точного совпадения ('Дроссель' -> 'Дроссел')
-        kw_stem = (
-            keyword[:-1]
-            if (keyword and len(keyword) > 5 and keyword[-1].lower() in "ьияеаыоую")
-            else keyword
-        )
-
+        token_groups = self._extract_search_tokens(keyword)
         etim_sql, etim_params = self._build_etim_filter(etim_class)
+        price_cond = "COALESCE(rrc_price_rub_with_vat, base_price) IS NOT NULL AND COALESCE(price_on_request, 0) = 0"
 
-        # Каскад 1: Строгий инженерный подбор (мощность >= требуемой в пределах +15%, точное напряжение и IP)
-        query1 = "SELECT * FROM equipment_items WHERE rrc_price_rub_with_vat IS NOT NULL" + etim_sql
-        params1: List[Any] = list(etim_params)
+        # Каскад 1: Строгий подбор по параметрам + все смысловые токены
+        tok_sql_all, tok_params_all = self._build_token_sql(token_groups, require_all=True)
+        query1 = f"SELECT * FROM equipment_items WHERE {price_cond}" + etim_sql + tok_sql_all
+        params1: List[Any] = list(etim_params) + list(tok_params_all)
+
         if power_kw is not None:
             query1 += " AND power_kw >= ? AND power_kw <= ?"
-            params1.extend([power_kw * 0.98, power_kw * 1.15 + 0.5])
+            params1.extend([power_kw * 0.98, power_kw * 1.25 + 0.5])
         if current_a is not None:
             query1 += " AND rated_current_a >= ? AND rated_current_a <= ?"
             params1.extend([current_a * 0.95, current_a * 1.25 + 2.0])
         if voltage_v is not None:
             if voltage_v == 400.0:
-                query1 += " AND (voltage_v = 400.0 OR voltage_v = 3.0)"
+                # Учитываем также инверторы Deye, у которых фазность 3 записана в specifications
+                query1 += " AND (voltage_v = 400.0 OR voltage_v = 3.0 OR specifications LIKE '%\"description\": \"3\"%')"
             else:
                 query1 += " AND voltage_v = ?"
                 params1.append(voltage_v)
@@ -160,64 +236,56 @@ class EngineerAgent:
             query1 += " AND ip_rating = ?"
             params1.append(ip_rating)
         if brand:
-            query1 += " AND brand LIKE ?"
-            params1.append(f"%{brand}%")
-        if kw_stem:
-            query1 += " AND (product_name LIKE ? OR model_code LIKE ? OR specifications LIKE ?)"
-            params1.extend([f"%{kw_stem}%", f"%{kw_stem}%", f"%{kw_stem}%"])
+            query1 += " AND (LOWER(brand) LIKE LOWER(?) OR LOWER(product_name) LIKE LOWER(?))"
+            params1.extend([f"%{brand}%", f"%{brand}%"])
 
-        query1 += " ORDER BY power_kw ASC, rrc_price_rub_with_vat ASC LIMIT 1"
+        query1 += " ORDER BY power_kw ASC, COALESCE(rrc_price_rub_with_vat, base_price) ASC LIMIT 1"
         cur.execute(query1, params1)
         row = cur.fetchone()
 
-        # Каскад 2: Ослабляем фильтр IP и напряжения
+        # Каскад 2: Поиск по классу ETIM, мощности и хотя бы одному смысловому токену (OR)
         if not row:
-            query2 = "SELECT * FROM equipment_items WHERE rrc_price_rub_with_vat IS NOT NULL" + etim_sql
-            params2: List[Any] = list(etim_params)
+            tok_sql_any, tok_params_any = self._build_token_sql(token_groups, require_all=False)
+            query2 = f"SELECT * FROM equipment_items WHERE {price_cond}" + etim_sql + tok_sql_any
+            params2: List[Any] = list(etim_params) + list(tok_params_any)
             if power_kw is not None:
                 query2 += " AND power_kw >= ? AND power_kw <= ?"
-                params2.extend([power_kw * 0.90, power_kw * 1.35 + 1.0])
-            if current_a is not None:
-                query2 += " AND rated_current_a >= ? AND rated_current_a <= ?"
-                params2.extend([current_a * 0.85, current_a * 1.40 + 5.0])
+                params2.extend([power_kw * 0.95, power_kw * 1.35 + 1.0])
             if brand:
-                query2 += " AND brand LIKE ?"
-                params2.append(f"%{brand}%")
-            if kw_stem:
-                query2 += " AND (product_name LIKE ? OR model_code LIKE ? OR specifications LIKE ?)"
-                params2.extend([f"%{kw_stem}%", f"%{kw_stem}%", f"%{kw_stem}%"])
-            query2 += " ORDER BY power_kw ASC, rrc_price_rub_with_vat ASC LIMIT 1"
+                query2 += " AND (LOWER(brand) LIKE LOWER(?) OR LOWER(product_name) LIKE LOWER(?))"
+                params2.extend([f"%{brand}%", f"%{brand}%"])
+            query2 += " ORDER BY power_kw ASC, COALESCE(rrc_price_rub_with_vat, base_price) ASC LIMIT 1"
             cur.execute(query2, params2)
             row = cur.fetchone()
 
-        # Каскад 3: Широкий поиск по классу, ключевому слову и бренду
-        if not row and (etim_class or kw_stem):
-            query3 = "SELECT * FROM equipment_items WHERE rrc_price_rub_with_vat IS NOT NULL" + etim_sql
-            params3: List[Any] = list(etim_params)
+        # Каскад 3: Широкий поиск по классу ETIM / токенам без жёстких рамок мощности
+        if not row and (etim_class or token_groups):
+            tok_sql_any, tok_params_any = self._build_token_sql(token_groups, require_all=False)
+            query3 = f"SELECT * FROM equipment_items WHERE {price_cond}" + etim_sql + tok_sql_any
+            params3: List[Any] = list(etim_params) + list(tok_params_any)
             if brand:
-                query3 += " AND brand LIKE ?"
-                params3.append(f"%{brand}%")
-            if kw_stem:
-                query3 += " AND (product_name LIKE ? OR model_code LIKE ? OR specifications LIKE ?)"
-                params3.extend([f"%{kw_stem}%", f"%{kw_stem}%", f"%{kw_stem}%"])
-            query3 += " ORDER BY rrc_price_rub_with_vat ASC LIMIT 1"
+                query3 += " AND (LOWER(brand) LIKE LOWER(?) OR LOWER(product_name) LIKE LOWER(?))"
+                params3.extend([f"%{brand}%", f"%{brand}%"])
+            # Для высоковольтных LiFePO4 48/51.2В отдаём приоритет 51.2В модулям
+            if etim_class == "EC_BATTERY" and any("LFP" in g for g in token_groups):
+                query3 += " ORDER BY CASE WHEN voltage_v >= 48.0 THEN 0 ELSE 1 END, COALESCE(rrc_price_rub_with_vat, base_price) ASC LIMIT 1"
+            else:
+                query3 += " ORDER BY COALESCE(rrc_price_rub_with_vat, base_price) ASC LIMIT 1"
             cur.execute(query3, params3)
             row = cur.fetchone()
 
         conn.close()
         if row:
             res = dict(row)
-            res["quantity"] = int(req.get("quantity", 1))
-            res["match_level"] = "Точный подбор ETIM"
+            if res.get("rrc_price_rub_with_vat") is None and res.get("base_price") is not None:
+                res["rrc_price_rub_with_vat"] = float(res["base_price"])
+            qty = int(req.get("quantity", 1))
+            res["quantity"] = self._adjust_battery_qty_by_kwh(res, keyword, qty)
+            res["match_level"] = "Параметрический подбор ETIM"
             return res
         return {"status": "NOT_FOUND", "request": req}
 
     def process_specification_batch(self, spec_list: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Обрабатывает спецификацию любого размера:
-          - Для строк с 'autonomy_minutes' или 'type == UPS_SIZING' запускает инженерный конструктор ИБП;
-          - Для остальных строк запускает 3-уровневый каскадный подбор ETIM.
-        """
         has_ups_sizing = any(
             r.get("type") == "UPS_SIZING" or r.get("autonomy_minutes") is not None
             for r in spec_list
@@ -361,11 +429,6 @@ class ConductorSupervisor:
         )
 
     def handle_natural_language_request(self, user_text: str) -> Dict[str, Any]:
-        """
-        Принимает запрос на естественном языке (с изоляцией от Prompt Injection),
-        через LLM Агента-Дирижера (с каскадным переключением провайдеров) строит
-        валидированный JSON-план и запускает нужную ветку агентов.
-        """
         sep = "=" * 75
         print(f"\n{sep}")
         print(f"[ВХОДЯЩИЙ ЗАПРОС В ШТАБ | Движок: {self.provider_name}]:")
@@ -478,24 +541,20 @@ class ConductorSupervisor:
         include_pnr_in_price: bool = True,
         pnr_separate_rub: float = 0.0,
     ) -> Dict[str, Any]:
-        """Координирует полный цикл расчёта сложного ТКП: Курсы -> Инженер -> Менеджер -> DOCX + XLSX."""
         sep = "=" * 75
         print(f"\n{sep}")
         print(f"[АГЕНТ-ДИРИЖЕР]: Принята заявка '{project_name}'")
         print(f"[АГЕНТ-ДИРИЖЕР]: Пунктов ТЗ на входе: {len(spec_rows)}")
         print(sep)
 
-        # 1. Дирижер проверяет актуальность курсов через Сисадмина
         self.sysadmin.sync_rates()
 
-        # 2. Дирижер передает техническую часть Агенту-Инженеру
         eng_report = self.engineer.process_specification_batch(spec_rows)
         if eng_report.get("engineering_notes"):
             print("  [Инженерное обоснование расчёта]:")
             for n in eng_report["engineering_notes"]:
                 print(f"    • {n}")
 
-        # 3. Дирижер передает подобранные артикулы Агенту-Менеджеру для расчёта и генерации DOCX + XLSX
         mgr_report = self.manager.build_commercial_offer(
             matched_items=eng_report["matched_items"],
             client_name=client_name,
@@ -520,37 +579,3 @@ class ConductorSupervisor:
         print(f"  • Официальное ТКП (Word): {mgr_report['file_path']}")
         print(f"  • Внутренний расчёт (Excel): {mgr_report['xlsx_path']}")
         return {"engineering": eng_report, "commercial": mgr_report}
-
-
-# ==============================================================================
-# ТЕСТОВЫЙ СТЕНД: ПРОВЕРКА РЕАЛЬНОГО КЕЙСА ИБП
-# ==============================================================================
-if __name__ == "__main__":
-    try:
-        os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    except Exception:
-        pass
-
-    supervisor = ConductorSupervisor()
-
-    real_ups_tz = [
-        {
-            "type": "UPS_SIZING",
-            "load_kw": 12.0,
-            "autonomy_minutes": 30,
-            "battery_chemistry": "AGM",
-            "quantity": 1,
-        }
-    ]
-
-    supervisor.execute_complex_tender_specification(
-        spec_rows=real_ups_tz,
-        client_name="ООО «СибМедСтрой»",
-        client_address="г. Новокузнецк, просп. Металлургов, 19",
-        project_name="Система гарантированного электропитания ИБП 15 кВА (нагрузка 12 кВт, автономия 30 мин)",
-        markup_percent=35.0,
-        delivery_percent=7.0,
-        output_docx="TKP_Real_Case_UPS_12kW_30min.docx",
-        bundled_mode=True,
-        include_pnr_in_price=True,
-    )
